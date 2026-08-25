@@ -602,9 +602,15 @@ function render(){
   grupos.forEach(([nombre, lista]) => {
     const rr = resumen(lista);
     const vis = lista.filter(visible);
-    if (vis.length) hayVisible = true;
+    if (!vis.length) return;              // el edificio no aporta nada con este filtro
+    hayVisible = true;
     const completo = rr.pendiente === 0;
     const abierto = S.abiertos.has(nombre);
+
+    const hall = rr.observado + rr.fuera;
+    const pill = S.filtro === 'hallazgos'
+      ? `<span class="pill rest">${hall} ${hall === 1 ? 'hallazgo' : 'hallazgos'}</span>`
+      : `<span class="pill ${completo?'done':'rest'}">${completo ? 'Completo' : 'Faltan ' + rr.pendiente}</span>`;
 
     html += `<section class="edif ${abierto?'open':''}" data-ed="${esc(nombre)}">
       <button class="edif-head" data-toggle="${esc(nombre)}">
@@ -612,7 +618,7 @@ function render(){
         <span class="edif-name">${esc(nombre)}</span>
         <span class="edif-prog">
           <span class="counter ${completo?'full':''}"><span class="done">${rr.revisados}</span> <em>de</em> ${rr.total}</span>
-          <span class="pill ${completo?'done':'rest'}">${completo ? 'Completo' : 'Faltan ' + rr.pendiente}</span>
+          ${pill}
         </span>
       </button>
       <div class="edif-body">
@@ -620,9 +626,7 @@ function render(){
           <div class="rail mini">${lista.map(e=>`<button class="tick ${estadoDe(e)==='pendiente'?'':estadoDe(e)}" data-id="${e.id}" title="N° ${e.num_inventario} · ${esc(e.area)}"></button>`).join('')}</div>
         </div>`;
 
-    if (!vis.length) {
-      html += `<div class="empty" style="padding:26px">Nada que mostrar con el filtro actual.</div>`;
-    } else {
+    {
       let nivelPrev = Symbol();
       vis.forEach(e => {
         if (e.nivel !== nivelPrev) {
@@ -873,6 +877,7 @@ function bind(){
     const b = ev.target.closest('button'); if (!b) return;
     S.filtro = b.dataset.f;
     $$('#filtros button').forEach(x => x.classList.toggle('on', x === b));
+    if (S.filtro === 'hallazgos') porEdificio().forEach(([n]) => S.abiertos.add(n));
     render();
   });
 
