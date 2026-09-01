@@ -237,6 +237,13 @@ textarea{
 .ficha .v{font-size:14px; font-weight:600; margin-top:2px}
 
 /* ---------- Varios ---------- */
+.hrow{display:flex; align-items:center; gap:12px; padding:13px 4px; width:100%;
+  text-align:left; border-bottom:1px solid var(--line)}
+.hrow:hover{background:var(--surface2)}
+.hrow .per{font-family:'Barlow Condensed'; font-size:21px; font-weight:700; min-width:92px}
+.hrow .who{flex:1; min-width:0; font-size:13px; color:var(--muted);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.hrow.on{background:var(--surface3)}
 .empty{padding:44px 20px; text-align:center; color:var(--muted)}
 .empty b{display:block; font-size:17px; color:var(--text); margin-bottom:6px; font-family:'Barlow Condensed'; letter-spacing:.02em}
 #toast{
@@ -275,6 +282,7 @@ textarea{
     </div>
     <div class="spacer"></div>
     <div class="conn" id="conn"><span class="dot" id="connDot"></span><span id="connTxt">Conectando…</span></div>
+    <button class="btn ghost" id="btnHist">Historial</button>
     <button class="btn primary" id="btnExport">Descargar Excel</button>
   </div>
 </header>
@@ -381,6 +389,17 @@ textarea{
   </div>
 </div>
 
+<div class="sheet" id="histSheet" role="dialog" aria-modal="true">
+  <div class="sheet-head">
+    <div class="t">
+      <h2>Rondas registradas</h2>
+      <div class="sub">Toca un mes para abrirlo y descargar su reporte</div>
+    </div>
+    <button class="btn sm ghost" id="histClose" aria-label="Cerrar">✕</button>
+  </div>
+  <div class="sheet-body" id="histBody"></div>
+</div>
+
 <div id="toast"></div>
 
 <script>
@@ -412,7 +431,7 @@ const INV_COMPACT = [[1,"SM 50",-1,"Pasillo ascensor 1-2","5kg","BC","CO2","9972
 
 /* ------------------------- Estado de la app ------------------------- */
 const S = {
-  sb:null, demo:false,
+  sb:null, demo:false, offline:false, cola:[], fotosPend:{}, sincronizando:false,
   inv:[], rev:{},            // rev[extintor_id] = revisión
   ronda:null, periodo:'',
   filtro:'pendientes', q:'',
@@ -424,6 +443,86 @@ const S = {
 const $  = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const esc = t => String(t ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+const COLA_KEY = 'ronda_extintores_dcsm_cola_v1';
+
+function colaLeer(){
+  try { return JSON.parse(localStorage.getItem(COLA_KEY)) || []; } catch(e){ return []; }
+}
+function colaPersistir(){
+  try { localStorage.setItem(COLA_KEY, JSON.stringify(S.cola)); } catch(e){}
+}
+function colaEncolar(periodo, fila){
+  S.cola = S.cola.filter(x => !(x.periodo === periodo && x.fila.extintor_id === fila.extintor_id));
+  S.cola.push({ periodo, fila });
+  colaPersistir();
+}
+function aplicarCola(){
+  S.cola.filter(x => x.periodo === S.periodo)
+        .forEach(x => S.rev[x.fila.extintor_id] = Object.assign({ id:'cola' }, x.fila));
+}
+function pintarEstado(){
+  const n = S.cola.length, dot = $('#connDot'), txt = $('#connTxt');
+  if (n)            { dot.className = 'dot demo'; txt.textContent = n + (n === 1 ? ' sin sincronizar' : ' sin sincronizar'); }
+  else if (S.offline){ dot.className = 'dot demo'; txt.textContent = 'Sin conexión'; }
+  else if (S.demo)  { dot.className = 'dot demo'; txt.textContent = 'Modo local (sin guardar)'; }
+  else              { dot.className = 'dot live'; txt.textContent = 'Supabase conectado'; }
+}
+
+// sube todo lo pendiente; se llama sola al volver la conexión
+async function sincronizar(manual){
+  if (S.sincronizando || S.demo || !S.sb || !S.cola.length) {
+    if (manual && !S.cola.length) toast('No hay nada pendiente por sincronizar');
+    return;
+  }
+  S.sincronizando = true;
+  const antes = S.cola.length;
+  try {
+    const periodos = [...new Set(S.cola.map(x => x.periodo))];
+    for (const per of periodos) {
+      // resolver (o crear) la ronda de ese mes
+      let { data:r } = await S.sb.from('rondas_extintores_dcsm')
+        .select('*').eq('periodo', per).maybeSingle();
+      if (!r) {
+        const ins = await S.sb.from('rondas_extintores_dcsm')
+          .insert({ periodo:per, responsable:$('#responsable').value || null })
+          .select().single();
+        if (ins.error) throw ins.error;
+        r = ins.data;
+      }
+      if (per === S.periodo) S.ronda = r;
+
+      for (const item of S.cola.filter(x => x.periodo === per)) {
+        const fila = Object.assign({}, item.fila, { ronda_id:r.id });
+        const f = S.fotosPend[per + ':' + fila.extintor_id];
+        if (f) {
+          const ext = (f.name.split('.').pop() || 'jpg').toLowerCase();
+          const ruta = `${per}/ext-${fila.extintor_id}-${Date.now()}.${ext}`;
+          const up = await S.sb.storage.from(BUCKET_FOTOS).upload(ruta, f, { upsert:true });
+          if (!up.error) {
+            fila.foto_url = S.sb.storage.from(BUCKET_FOTOS).getPublicUrl(ruta).data.publicUrl;
+            delete S.fotosPend[per + ':' + fila.extintor_id];
+          }
+        }
+        const { data, error } = await S.sb.from('revisiones_extintores_dcsm')
+          .upsert(fila, { onConflict:'ronda_id,extintor_id' }).select().single();
+        if (error) throw error;
+        S.cola = S.cola.filter(x => x !== item);
+        colaPersistir();
+        if (per === S.periodo) S.rev[fila.extintor_id] = data;
+      }
+    }
+    S.offline = false;
+    if (antes) toast(`${antes} ${antes === 1 ? 'revisión sincronizada' : 'revisiones sincronizadas'}`);
+  } catch(err){
+    console.error(err);
+    S.offline = true;
+    if (manual) toast('Sigue sin conexión. Lo pendiente se mantiene guardado.', true);
+  } finally {
+    S.sincronizando = false;
+    aplicarRonda(); pintarEstado(); render();
+  }
+}
 
 function toast(msg, err){
   const t = $('#toast');
@@ -441,14 +540,21 @@ async function init(){
   S.periodo = periodoActual();
   $('#periodo').value = S.periodo;
 
+  S.cola = colaLeer();
+
   if (SUPABASE_KEY && window.supabase) {
+    S.sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     try {
-      S.sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
       await cargarInventario();
-      setConn('live', 'Supabase conectado');
+      S.offline = false;
     } catch (e) {
       console.error(e);
-      activarDemo('No se pudo conectar a Supabase: ' + (e.message || e));
+      S.offline = true;                 // sin red: inventario embebido, cola activa
+      inventarioLocal();
+      $('#noticeSlot').innerHTML =
+        '<div class="notice"><span>⚠</span><div><b>Sin conexión.</b> Puedes hacer la ronda igual: '
+        + 'cada revisión queda guardada en el teléfono y se sube sola al recuperar señal. '
+        + 'No cierres la pestaña hasta que el indicador vuelva a verde.</div></div>';
     }
   } else {
     activarDemo();
@@ -456,12 +562,24 @@ async function init(){
 
   await cargarRonda();
   bind();
+  pintarEstado();
   render();
+  if (S.cola.length) sincronizar();
+  setInterval(() => { if (S.cola.length) sincronizar(); }, 45000);
+  window.addEventListener('online', () => sincronizar());
 }
 
 function setConn(mode, txt){
   $('#connDot').className = 'dot ' + mode;
   $('#connTxt').textContent = txt;
+}
+
+function inventarioLocal(){
+  S.inv = INV_COMPACT.map((a,i)=>({
+    id:i+1, num_inventario:a[0], edificio:a[1], nivel:a[2], area:a[3],
+    capacidad:a[4], clase:a[5], tipo:a[6], n_certificacion:a[7],
+    ultima_recarga:a[8], vencimiento_recarga:a[9], orden:i+1
+  }));
 }
 
 function activarDemo(motivo){
@@ -503,38 +621,83 @@ async function cargarRonda(){
   S.rev = {};
   if (S.demo || !S.sb) {
     S.ronda = { id:'local', periodo:S.periodo, estado:'en_progreso', responsable:'' };
-    aplicarRonda(); return;
+    aplicarCola(); aplicarRonda(); pintarEstado(); return;
   }
   try {
-    let { data:r } = await S.sb.from('rondas_extintores_dcsm')
+    const { data:r } = await S.sb.from('rondas_extintores_dcsm')
       .select('*').eq('periodo', S.periodo).maybeSingle();
-    if (!r) {
-      const ins = await S.sb.from('rondas_extintores_dcsm')
-        .insert({ periodo:S.periodo, responsable:$('#responsable').value || null })
-        .select().single();
-      if (ins.error) throw ins.error;
-      r = ins.data;
+    S.ronda = r || null;                     // sin ronda = mes aún sin iniciar
+    if (r) {
+      const { data:revs, error } = await S.sb.from('revisiones_extintores_dcsm')
+        .select('*').eq('ronda_id', r.id);
+      if (error) throw error;
+      (revs||[]).forEach(v => S.rev[v.extintor_id] = v);
     }
-    S.ronda = r;
-    const { data:revs, error } = await S.sb.from('revisiones_extintores_dcsm')
-      .select('*').eq('ronda_id', r.id);
-    if (error) throw error;
-    (revs||[]).forEach(v => S.rev[v.extintor_id] = v);
-    aplicarRonda();
+    S.offline = false;
   } catch(e){
     console.error(e);
-    toast('Error al cargar la ronda: ' + (e.message||e), true);
+    S.offline = true;
+    S.ronda = null;
   }
+  aplicarCola();
+  aplicarRonda();
+  pintarEstado();
 }
 
 function aplicarRonda(){
-  if (!S.ronda) return;
+  const b = $('#estadoRonda');
+  if (!S.ronda) {
+    b.className = 'badge cerrada';
+    b.textContent = 'Sin iniciar';
+    $('#btnCerrar').textContent = 'Cerrar ronda';
+    return;
+  }
   if (S.ronda.responsable) $('#responsable').value = S.ronda.responsable;
   const cerrada = S.ronda.estado === 'cerrada';
-  const b = $('#estadoRonda');
   b.className = 'badge ' + (cerrada ? 'cerrada' : 'abierta');
   b.textContent = cerrada ? 'Cerrada' : 'En progreso';
   $('#btnCerrar').textContent = cerrada ? 'Reabrir ronda' : 'Cerrar ronda';
+}
+
+// crea la ronda del período recién cuando se guarda la primera revisión
+async function asegurarRonda(){
+  if (S.ronda) return S.ronda;
+  if (S.demo || !S.sb) {
+    S.ronda = { id:'local', periodo:S.periodo, estado:'en_progreso', responsable:'' };
+    aplicarRonda(); return S.ronda;
+  }
+  const ins = await S.sb.from('rondas_extintores_dcsm')
+    .insert({ periodo:S.periodo, responsable:$('#responsable').value || null })
+    .select().single();
+  if (ins.error) throw ins.error;
+  S.ronda = ins.data; aplicarRonda();
+  return S.ronda;
+}
+
+// lista de meses con ronda registrada
+async function abrirHistorial(){
+  const cont = $('#histBody');
+  cont.innerHTML = '<div class="empty">Cargando…</div>';
+  $('#backdrop').classList.add('on');
+  $('#histSheet').classList.add('on');
+  if (S.demo || !S.sb) {
+    cont.innerHTML = '<div class="empty"><b>Sin conexión</b>El historial requiere '
+      + 'la conexión a Supabase.</div>';
+    return;
+  }
+  const { data, error } = await S.sb.from('rondas_extintores_dcsm')
+    .select('*').order('periodo', { ascending:false });
+  if (error || !data || !data.length) {
+    cont.innerHTML = '<div class="empty"><b>Sin rondas registradas</b>'
+      + 'Aparecerán aquí en cuanto guardes la primera revisión de un mes.</div>';
+    return;
+  }
+  cont.innerHTML = data.map(r => `<button class="hrow ${r.periodo===S.periodo?'on':''}" data-p="${r.periodo}">
+      <span class="per">${r.periodo}</span>
+      <span class="badge ${r.estado==='cerrada'?'cerrada':'abierta'}">${r.estado==='cerrada'?'Cerrada':'En progreso'}</span>
+      <span class="who">${esc(r.responsable || 'sin responsable')}</span>
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" style="opacity:.5"><path d="M9 5l7 7-7 7"/></svg>
+    </button>`).join('');
 }
 
 /* ------------------------- Cálculos --------------------------------- */
@@ -732,6 +895,7 @@ function sugerirResultado(){
 function cerrarSheet(){
   $('#backdrop').classList.remove('on');
   $('#sheet').classList.remove('on');
+  $('#histSheet').classList.remove('on');
   S.actual = null;
 }
 
@@ -740,7 +904,7 @@ async function guardar(){
   if (!e) return;
   if (S.ronda && S.ronda.estado === 'cerrada') { toast('La ronda está cerrada. Reábrela para editar.', true); return; }
 
-  const fila = { ronda_id:S.ronda.id, extintor_id:e.id };
+  const fila = { extintor_id:e.id };
   ITEMS.forEach(([k]) => fila[k] = S.draft[k]);
   fila.resultado = S.draft.resultado;
   fila.observaciones = $('#shObs').value.trim() || null;
@@ -753,40 +917,19 @@ async function guardar(){
     $('#shObs').focus(); return;
   }
 
-  $('#shSave').disabled = true;
-  try {
-    if (S.fotoFile && S.sb && !S.demo) {
-      const ext = (S.fotoFile.name.split('.').pop() || 'jpg').toLowerCase();
-      const ruta = `${S.periodo}/ext-${e.num_inventario}-${Date.now()}.${ext}`;
-      const up = await S.sb.storage.from(BUCKET_FOTOS).upload(ruta, S.fotoFile, { upsert:true });
-      if (up.error) toast('Revisión guardada, la foto no subió', true);
-      else fila.foto_url = S.sb.storage.from(BUCKET_FOTOS).getPublicUrl(ruta).data.publicUrl;
-    }
+  // 1) se guarda SIEMPRE en el dispositivo: nada se pierde por falta de señal
+  colaEncolar(S.periodo, fila);
+  if (S.fotoFile) S.fotosPend[S.periodo + ':' + e.id] = S.fotoFile;
+  S.rev[e.id] = Object.assign({ id:'cola' }, fila);
+  S.abiertos.add(e.edificio);
+  cerrarSheet();
 
-    if (S.demo || !S.sb) {
-      S.rev[e.id] = Object.assign({ id:'local-'+e.id }, fila);
-    } else {
-      const { data, error } = await S.sb.from('revisiones_extintores_dcsm')
-        .upsert(fila, { onConflict:'ronda_id,extintor_id' }).select().single();
-      if (error) throw error;
-      S.rev[e.id] = data;
-      if (fila.revisado_por && S.ronda.responsable !== fila.revisado_por) {
-        await S.sb.from('rondas_extintores_dcsm').update({ responsable:fila.revisado_por }).eq('id', S.ronda.id);
-        S.ronda.responsable = fila.revisado_por;
-      }
-    }
+  toast(`Guardado · quedan ${resumen(S.inv).pendiente} por revisar`);
+  pintarEstado();
+  render();
 
-    const pend = resumen(S.inv).pendiente;
-    toast(`Guardado · quedan ${pend} por revisar`);
-    S.abiertos.add(e.edificio);
-    cerrarSheet();
-    render();
-  } catch(err){
-    console.error(err);
-    toast('No se pudo guardar: ' + (err.message || err), true);
-  } finally {
-    $('#shSave').disabled = false;
-  }
+  // 2) se intenta subir de inmediato; si no hay red queda en la cola
+  if (!S.demo && S.sb) sincronizar();
 }
 
 /* --------------------------- Excel ---------------------------------- */
@@ -796,6 +939,8 @@ const ETQR = { conforme:'Conforme', observado:'Observado', fuera_servicio:'Fuera
 
 function exportar(){
   if (!S.inv.length) { toast('Sin inventario cargado', true); return; }
+  if (S.cola.length && !confirm('Hay ' + S.cola.length + ' revisiones sin sincronizar. '
+      + 'El Excel las incluye, pero aún no están en la base de datos. ¿Descargar igual?')) return;
   const wb = XLSX.utils.book_new();
   const resp = $('#responsable').value.trim() || '—';
 
@@ -904,7 +1049,7 @@ function bind(){
   });
 
   $('#btnCerrar').addEventListener('click', async () => {
-    if (!S.ronda) return;
+    if (!S.ronda) { toast('Este mes todavía no tiene revisiones registradas', true); return; }
     const cerrar = S.ronda.estado !== 'cerrada';
     const r = resumen(S.inv);
     if (cerrar && r.pendiente > 0 &&
@@ -920,6 +1065,21 @@ function bind(){
   });
 
   $('#btnExport').addEventListener('click', exportar);
+
+  $('#conn').style.cursor = 'pointer';
+  $('#conn').title = 'Reintentar sincronización';
+  $('#conn').addEventListener('click', () => sincronizar(true));
+
+  $('#btnHist').addEventListener('click', abrirHistorial);
+  $('#histClose').addEventListener('click', cerrarSheet);
+  $('#histBody').addEventListener('click', async ev => {
+    const b = ev.target.closest('[data-p]'); if (!b) return;
+    S.periodo = b.dataset.p;
+    $('#periodo').value = S.periodo;
+    cerrarSheet();
+    await cargarRonda(); render();
+    toast('Ronda de ' + S.periodo);
+  });
 
   $('#shChecks').addEventListener('click', ev => {
     const b = ev.target.closest('.tri button'); if (!b) return;
@@ -955,7 +1115,10 @@ function bind(){
   $('#shSkip').addEventListener('click', cerrarSheet);
   $('#shClose').addEventListener('click', cerrarSheet);
   $('#backdrop').addEventListener('click', cerrarSheet);
-  document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && S.actual) cerrarSheet(); });
+  document.addEventListener('keydown', ev => {
+    if (ev.key === 'Escape' &&
+        (S.actual || $('#histSheet').classList.contains('on'))) cerrarSheet();
+  });
 }
 
 init();
